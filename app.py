@@ -128,6 +128,26 @@ def api_news():
     return jsonify({"articles":arr,"count":len(arr)})
 @app.get("/health")
 def health(): return jsonify({"ok":True,"service":"VainahNews"})
+sync_lock = threading.Lock()
+sync_status = {"state": "idle", "message": "Импорт ещё не запускался"}
+
+def sync_background():
+    try:
+        sync_status.update(state="running", message="RSS загружается")
+        count = sync()
+        sync_status.update(state="finished", message="Новых статей: " + str(count))
+        app.logger.info("RSS import completed, added=%s", count)
+    except Exception:
+        app.logger.exception("RSS import failed")
+        sync_status.update(state="error", message="Ошибка RSS, проверьте Logs")
+    finally:
+        sync_lock.release()
+
+@app.get("/admin/import-status")
+def import_status():
+    if not session.get("admin"): abort(403)
+    return jsonify(sync_status)
+
 @app.route("/admin",methods=["GET","POST"])
 def admin():
     password=os.getenv("ADMIN_PASSWORD")
@@ -141,7 +161,9 @@ def admin():
     if request.method=="POST":
         if request.form.get("token") != session.get("csrf"):abort(403)
         action=request.form.get("action")
-        if action=="sync":sync()
+        if action=="sync":
+            if sync_lock.acquire(blocking=False):
+                threading.Thread(target=sync_background, daemon=True).start()
         elif action=="publish":
             title=request.form.get("title","").strip()[:300]
             summary=request.form.get("summary","").strip()[:30000]
@@ -152,10 +174,10 @@ def admin():
         return redirect("/admin")
     session.setdefault("csrf",secrets.token_urlsafe(24))
     with db() as c: count=c.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
-    return page("Редакция",'''<h1>Редакция VainahNews</h1><p>Всего материалов: {{count}}</p>
+    return page("Редакция",'''<h1>Редакция VainahNews</h1><p>Всего материалов: {{count}}</p><p>Импорт: {{sync_message}}</p><p><a href="/admin/import-status">Статус импорта</a></p>
     <div class="box"><form method="post"><input type="hidden" name="token" value="{{token}}"><input type="hidden" name="action" value="sync"><button>Обновить RSS</button></form></div>
     <div class="box"><h2>Опубликовать собственную статью</h2><form method="post"><input type="hidden" name="token" value="{{token}}">
     <input type="hidden" name="action" value="publish">
     <label>Заголовок<input name="title" required maxlength="300"></label><label>Раздел<select name="category">{% for c in categories %}<option>{{c}}</option>{% endfor %}</select></label>
-    <label>Текст<textarea name="summary" rows="18" required maxlength="30000"></textarea></label><button>Опубликовать</button></form></div>''',count=count,token=session["csrf"],categories=CATEGORIES)
+    <label>Текст<textarea name="summary" rows="18" required maxlength="30000"></textarea></label><button>Опубликовать</button></form></div>''',count=count,token=session["csrf"],categories=CATEGORIES,sync_message=sync_status["message"])
 if __name__=="__main__":app.run(port=int(os.getenv("PORT","5050")))
